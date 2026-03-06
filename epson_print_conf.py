@@ -435,7 +435,7 @@ class EpsonPrinter:
             "wifi_mac_address": range(1920, 1926),
         },
         "L3150": {
-            "alias": ["L3151", "L3160", "L3166", "L3168"],
+            "alias": ["L3151", "L3160", "L3166", "L3168", "L3250", "L3251", "L3260"],
             "read_key": [151, 7],
             "write_key": b'Maribaya',
             "main_waste": {"oids": [48, 49, 47], "divider": 63.46},
@@ -1967,6 +1967,24 @@ class EpsonPrinter:
                     f"No value for SNMP OID '{name}'. MIB: {oid}.")
         return sys_info
 
+    def snmp_connectivity_test(self) -> str:
+        """
+        Try a single standard SNMP GET (sysDescr) to verify SNMP reachability.
+        Returns the sysDescr string if successful, None otherwise.
+        """
+        if not self.hostname:
+            return None
+        oid = "1.3.6.1.2.1.1.1.0"  # sysDescr (standard, almost all devices support it)
+        try:
+            tag, result = self.fetch_oid_values(oid, label="snmp_connectivity_test")[0]
+            if result is not None and result is not False:
+                if isinstance(result, bytes):
+                    return result.decode(errors="replace")
+                return str(result)
+        except Exception:
+            pass
+        return None
+
     def get_serial_number(self) -> str:
         """Return the serial number of the printer (or "?" if error)."""
         if not self.parm:
@@ -1974,6 +1992,7 @@ class EpsonPrinter:
             return None
         if "serial_number" not in self.parm:
             return None
+        result = None
         if isinstance(self.parm["serial_number"], (list, tuple)):
             left_val = None
             for i in self.parm["serial_number"]:
@@ -1982,18 +2001,33 @@ class EpsonPrinter:
                     for value in self.read_eeprom_many(i, label="serial_number")
                 )
                 if left_val is not None and val != left_val:
-                    return False
+                    result = False
+                    break
                 left_val = val
-            return left_val
+            result = left_val if result is not False else None
         else:
             try:
-                return "".join(
+                result = "".join(
                     chr(int(value or "0x3f", 16))  # "0x3f" --> "?"
                     for value in self.read_eeprom_many(
                         self.parm["serial_number"], label="serial_number")
                 )
             except Exception:
-                return None
+                result = None
+        # Fallback: try standard SNMP OIDs when EEPROM read fails (e.g. L3250/L3251)
+        if not result or result == "?" * (len(result) if result else 0):
+            for oid in (
+                    f"{self.MIB_MGMT}.43.5.1.1.17.1.1.1",   # prtGeneralSerialNumber
+                    f"{self.MIB_EPSON}.1.2.2.1.1.1.1.1",   # Epson device id
+            ):
+                tag, val = self.fetch_oid_values(oid, label="get_serial_number_fallback")[0]
+                if val and hasattr(val, 'decode'):
+                    s = val.decode().strip()
+                    if s and len(s) > 1:
+                        return s
+                elif val and isinstance(val, str) and val.strip():
+                    return val.strip()
+        return result
 
     def get_printer_brand(self) -> str:
         """Return the producer name of the printer ("EPSON")."""
@@ -2138,6 +2172,12 @@ class EpsonPrinter:
             f"  ADDRESS: {oid}"
         )
         tag, device_id = self.fetch_oid_values(oid, label=label)[0]
+        if device_id is None or device_id is False or not hasattr(device_id, 'decode'):
+            logging.debug(
+                "get_device_identification: no valid SNMP response (device_id=%s)",
+                type(device_id).__name__
+            )
+            return {}
         key_map = {
             "MFG": "Manufacturer",
             "CMD": "Commands",
@@ -2469,8 +2509,16 @@ class EpsonPrinter:
         Thanks to https://codeberg.org/atufi/reinkpy/issues/12#issuecomment-1661250
         """
         serial = self.get_serial_number()
-        if not serial:
-            return None
+        # L3250/L3251 etc. may return device_id string from SNMP fallback; use status serial if available
+        if not serial or ("MFG:" in serial and ";" in serial):
+            try:
+                st = self.get_printer_status()
+                if st and isinstance(st, dict) and st.get("serial_number_info"):
+                    serial = st["serial_number_info"]
+            except Exception:
+                pass
+        if not serial or ("MFG:" in serial and ";" in serial):
+            return False
         sha1 = hashlib.sha1(serial.encode())
         oid = self.epctrl_snmp_oid(
             "rw",  # This command stands for "reset waste".
@@ -2480,9 +2528,13 @@ class EpsonPrinter:
         if dry_run:
             return True
         answer = self.fetch_oid_values(oid, label="temp_reset_waste")[0]
-        status = b"rw:01:OK;" in answer[1]
+        resp = answer[1]
+        if resp is None or resp is False or not isinstance(resp, (bytes, bytearray)):
+            logging.info("temp_reset_waste: no valid SNMP response (e.g. timeout)")
+            return False
+        status = b"rw:01:OK;" in resp
         if not status:
-            print(answer)
+            logging.debug("temp_reset_waste: response was %s", repr(resp[:80]))
         return status
 
     def reset_waste_ink_levels(self, dry_run=False) -> bool:

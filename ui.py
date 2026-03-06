@@ -9,6 +9,8 @@ import os
 import sys
 import re
 import threading
+import queue
+import asyncio
 import ipaddress
 import inspect
 from datetime import datetime
@@ -1409,7 +1411,9 @@ Web site: https://github.com/Ircama/epson_print_conf
                 conf_dict=self.conf_dict,
                 replace_conf=self.replace_conf,
                 model=self.model_var.get(),
-                hostname=self.ip_var.get()
+                hostname=self.ip_var.get(),
+                timeout=5.0,
+                retries=2
             )
             if not self.printer:
                 return
@@ -1586,7 +1590,13 @@ Web site: https://github.com/Ircama/epson_print_conf
         if isinstance(e, TimeoutError):
             self.status_text.insert(tk.END, '[ERROR]', "error")
             self.status_text.insert(
-                tk.END, f" Printer is unreachable or offline.\n"
+                tk.END, " Printer is unreachable or offline (timeout).\n"
+            )
+            self.status_text.insert(tk.END, '[INFO]', "info")
+            self.status_text.insert(
+                tk.END,
+                " Check: printer is on, IP is correct, same network as PC,\n"
+                " and Windows Firewall allows Python outbound UDP port 161.\n"
             )
         else:
             self.status_text.insert(tk.END, '[ERROR]', "error")
@@ -1652,46 +1662,63 @@ Web site: https://github.com/Ircama/epson_print_conf
             return
         if not self.printer:
             return
+        ser_queue = queue.Queue()
+        printer = self.printer
+
+        def worker():
+            try:
+                asyncio.set_event_loop(asyncio.new_event_loop())
+                ser_num = printer.get_serial_number()
+                if ser_num and "MFG:" in ser_num and ";" in ser_num:
+                    try:
+                        st = printer.get_printer_status()
+                        if st and isinstance(st, dict) and st.get("serial_number_info"):
+                            ser_num = st["serial_number_info"]
+                    except Exception:
+                        pass
+                ser_queue.put(("ok", ser_num))
+            except Exception as e:
+                ser_queue.put(("error", e))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(200, lambda: self._poll_ser_number_queue(ser_queue))
+
+    def _poll_ser_number_queue(self, ser_queue):
         try:
-            ser_num = self.printer.get_serial_number()
-        except Exception as e:
-            self.handle_printer_error(e)
-            self.config(cursor="")
+            result = ser_queue.get_nowait()
+        except queue.Empty:
+            self.after(200, lambda: self._poll_ser_number_queue(ser_queue))
+            return
+        self.config(cursor="")
+        if result[0] == "error":
+            self.handle_printer_error(result[1])
             self.update_idletasks()
             return
+        ser_num = result[1]
         if ser_num is False:
             self.status_text.insert(tk.END, '[ERROR]', "error")
             self.status_text.insert(
                 tk.END,
                 f" Improper values in printer serial number.\n",
             )
-            self.config(cursor="")
-            self.update_idletasks()
-            return
-        if not ser_num:
+        elif not ser_num:
             self.status_text.insert(tk.END, '[ERROR]', "error")
             self.status_text.insert(
                 tk.END,
                 f" Cannot retrieve the printer serial number.\n",
             )
-            self.config(cursor="")
-            self.update_idletasks()
-            return
-        if "?" in ser_num:
+        elif "?" in ser_num:
             self.status_text.insert(tk.END, '[ERROR]', "error")
             self.status_text.insert(
                 tk.END,
                 f" Cannot retrieve the printer serial number. Possibly a printer firmware update disabled the operation.\n",
             )
-            self.config(cursor="")
-            self.update_idletasks()
-            return
-        self.status_text.insert(tk.END, '[INFO]', "info")
-        self.status_text.insert(
-            tk.END, f" Printer serial number: {ser_num}.\n"
-        )
-        self.ser_num_var.set(ser_num)
-        self.config(cursor="")
+        else:
+            self.status_text.insert(tk.END, '[INFO]', "info")
+            self.status_text.insert(
+                tk.END, f" Printer serial number: {ser_num}.\n"
+            )
+            self.ser_num_var.set(ser_num)
         self.update_idletasks()
 
     def get_mac_address(self, cursor=True):
@@ -2194,6 +2221,105 @@ Web site: https://github.com/Ircama/epson_print_conf
         self.status_text.grid_remove()
         self.tree_frame.grid()
 
+    def _has_no_usable_data(self, data):
+        """True if dict is empty or all values are empty/trivial (e.g. only '?')."""
+        if not data or not isinstance(data, dict):
+            return True
+        for v in data.values():
+            if v is None:
+                continue
+            if isinstance(v, dict):
+                if self._has_no_usable_data(v):
+                    continue
+                return False
+            if isinstance(v, (list, tuple)):
+                if not v or all(x in (None, "", "?") for x in v):
+                    continue
+                return False
+            s = str(v).strip()
+            if s and s.replace("?", "").replace(" ", ""):
+                return False
+        return True
+
+    def _apply_printer_status_result(self, printer, stat_set, snmp_test, ip_address):
+        """Apply status result on main thread (no SNMP calls)."""
+        try:
+            if not stat_set or (isinstance(stat_set, dict) and (len(stat_set) == 0 or self._has_no_usable_data(stat_set))):
+                self.show_status_text_view()
+                if snmp_test:
+                    self.status_text.insert(tk.END, '[INFO]', "info")
+                    self.status_text.insert(
+                        tk.END,
+                        " SNMP is reaching the printer (sysDescr):\n  "
+                        + snmp_test[:200] + ("..." if len(snmp_test) > 200 else "")
+                        + "\n\n"
+                    )
+                    self.status_text.insert(tk.END, '[WARNING]', "warn")
+                    self.status_text.insert(
+                        tk.END,
+                        " Status fields are empty because this model/firmware does not\n"
+                        " expose the required OIDs (e.g. EEPROM/status). You can still use:\n"
+                        " Temporary reset waste ink, Clean nozzles, Web interface button.\n\n"
+                    )
+                else:
+                    self.status_text.insert(tk.END, '[WARNING]', "warn")
+                    self.status_text.insert(
+                        tk.END,
+                        " No data received from the printer (SNMP did not respond).\n\n"
+                    )
+                    self.status_text.insert(tk.END, '[INFO]', "info")
+                    self.status_text.insert(
+                        tk.END,
+                        " Possible causes:\n"
+                        "  • Firewall on the PC is blocking outbound UDP port 161.\n"
+                        "  • SNMP disabled on the printer (you enabled it in Protocol settings).\n"
+                        f"  • Try: allow Python in Windows Firewall for UDP, or test from\n"
+                        f"    https://{ip_address} that SNMPv1/v2c stays enabled.\n\n"
+                        " You can still try: Temporary reset waste ink, Clean nozzles, or open\n"
+                        " the printer web page via the button in the application.\n"
+                    )
+            else:
+                self.text_dump = black.format_str(
+                    f'"{printer.model}": ' + repr(stat_set), mode=self.mode
+                )
+                self.show_status_text_view()
+                self.status_text.insert(tk.END, '[INFO]', "info")
+                self.status_text.insert(tk.END, " Printer status (copy from below):\n\n")
+                self.status_text.insert(tk.END, self.text_dump)
+                self.status_text.insert(tk.END, "\n")
+        except Exception as e:
+            self.handle_printer_error(e)
+        finally:
+            self.config(cursor="")
+            self.update_idletasks()
+
+    def _poll_status_queue(self, status_queue):
+        """Check for status result from worker thread; run on main thread."""
+        try:
+            result = status_queue.get_nowait()
+        except queue.Empty:
+            self.after(200, lambda: self._poll_status_queue(status_queue))
+            return
+        # result is ("ok", stat_set, snmp_test) or ("error", exception)
+        if result[0] == "error":
+            self.config(cursor="")
+            self.update_idletasks()
+            self.handle_printer_error(result[1])
+            return
+        _, stat_set, snmp_test = result
+        # Re-fetch printer for UI (same config, no SNMP in this call)
+        model = self.model_var.get()
+        ip_address = self.ip_var.get()
+        printer = EpsonPrinter(
+            conf_dict=self.conf_dict,
+            replace_conf=self.replace_conf,
+            model=model,
+            hostname=ip_address,
+            timeout=5.0,
+            retries=2
+        )
+        self._apply_printer_status_result(printer, stat_set, snmp_test, ip_address)
+
     def printer_status(self, cursor=True):
         if cursor:
             self.config(cursor="watch")
@@ -2219,33 +2345,28 @@ Web site: https://github.com/Ircama/epson_print_conf
             conf_dict=self.conf_dict,
             replace_conf=self.replace_conf,
             model=model,
-            hostname=ip_address
+            hostname=ip_address,
+            timeout=5.0,
+            retries=2
         )
         if not printer:
             return
-        try:
-            self.text_dump = black.format_str(
-                f'"{printer.model}": ' + repr(printer.stats()), mode=self.mode
-            )
-            self.show_treeview()
+        status_queue = queue.Queue()
 
-            # Configure tags
-            self.tree.tag_configure("key", foreground="black")
-            self.tree.tag_configure("key_value", foreground="dark blue")
-            self.tree.tag_configure("value", foreground="blue")
-            self.tree.heading("#0", text="Status Information", anchor="w")
+        def worker():
+            try:
+                asyncio.set_event_loop(asyncio.new_event_loop())
+                stat_set = printer.stats()
+                if not stat_set or (isinstance(stat_set, dict) and (len(stat_set) == 0 or self._has_no_usable_data(stat_set))):
+                    snmp_test = printer.snmp_connectivity_test()
+                else:
+                    snmp_test = None
+                status_queue.put(("ok", stat_set, snmp_test))
+            except Exception as e:
+                status_queue.put(("error", e))
 
-            # Populate the Treeview
-            self.tree.delete(*self.tree.get_children())
-            self.populate_treeview("", self.tree, printer.stats())
-
-            # Expand all nodes
-            self.expand_all(self.tree)
-        except Exception as e:
-            self.handle_printer_error(e)
-        finally:
-            self.config(cursor="")
-            self.update_idletasks()
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(200, lambda: self._poll_status_queue(status_queue))
 
     def reset_printer_model(self):
         self.show_status_text_view()
@@ -2494,7 +2615,9 @@ Web site: https://github.com/Ircama/epson_print_conf
             if not self.printer:
                 self.printer = EpsonPrinter(
                     conf_dict=self.conf_dict,
-                    hostname=self.ip_var.get()
+                    hostname=self.ip_var.get(),
+                    timeout=5.0,
+                    retries=2
                 )
                 self.printer.parm = {'read_key': None}
 
@@ -3690,30 +3813,54 @@ Web site: https://github.com/Ircama/epson_print_conf
         )
         response = messagebox.askyesno(*msg, default='no')
         if response:
-            try:
-                if self.printer.temporary_reset_waste():
-                    self.status_text.insert(tk.END, '[INFO]', "info")
-                    self.status_text.insert(
-                        tk.END,
-                        " Waste ink levels have been temporarily bypassed."
-                        " You can now print.\n"
-                    )
-                else:
-                    self.status_text.insert(tk.END, '[ERROR]', "error")
-                    self.status_text.insert(
-                        tk.END,
-                        " Failed to perform the temporary bypass of the "
-                        "waste ink levels."
-                    )
-            except Exception as e:
-                self.handle_printer_error(e)
+            reset_queue = queue.Queue()
+            printer = self.printer
+
+            def worker():
+                try:
+                    asyncio.set_event_loop(asyncio.new_event_loop())
+                    ok = printer.temporary_reset_waste()
+                    reset_queue.put(("ok", ok))
+                except Exception as e:
+                    reset_queue.put(("error", e))
+
+            threading.Thread(target=worker, daemon=True).start()
+            self.after(200, lambda: self._poll_temp_reset_queue(reset_queue))
         else:
             self.status_text.insert(tk.END, '[WARNING]', "warn")
             self.status_text.insert(
                 tk.END,
                 " Temporary bypass of the waste ink levels aborted.\n"
             )
+            self.config(cursor="")
+            self.update_idletasks()
+
+    def _poll_temp_reset_queue(self, reset_queue):
+        try:
+            result = reset_queue.get_nowait()
+        except queue.Empty:
+            self.after(200, lambda: self._poll_temp_reset_queue(reset_queue))
+            return
         self.config(cursor="")
+        if result[0] == "error":
+            self.handle_printer_error(result[1])
+            self.update_idletasks()
+            return
+        _, ok = result
+        if ok:
+            self.status_text.insert(tk.END, '[INFO]', "info")
+            self.status_text.insert(
+                tk.END,
+                " Waste ink levels have been temporarily bypassed."
+                " You can now print.\n"
+            )
+        else:
+            self.status_text.insert(tk.END, '[ERROR]', "error")
+            self.status_text.insert(
+                tk.END,
+                " Failed to perform the temporary bypass of the "
+                "waste ink levels. The printer may need the exact serial number (e.g. X8JK009913).\n"
+            )
         self.update_idletasks()
 
     def start_detect_printers(self):
@@ -3737,12 +3884,14 @@ Web site: https://github.com/Ircama/epson_print_conf
         self.detect_button.config(state=tk.DISABLED)  # disable button while processing
         self.show_status_text_view()
         try:
+            # SNMP runs in this thread; pysnmp needs an event loop in the current thread
+            asyncio.set_event_loop(asyncio.new_event_loop())
             # [{'ip': '...', 'hostname': '...', 'name': '...'}]
             printers = self.printer_scanner.get_all_printers(
                 self.ip_var.get().strip()
             )
             if len(printers) > 0:
-                if len(printers) == 1 and printers[0]['name'] != None:
+                if len(printers) == 1 and printers[0]['name'] is not None:
                     self.status_text.insert(tk.END, '[INFO]', "info")
                     self.status_text.insert(
                         tk.END,
@@ -3765,13 +3914,28 @@ Web site: https://github.com/Ircama/epson_print_conf
                             f' Printer model unknown.\n'
                         )
                         self.model_var.set("")
+                elif len(printers) == 1 and printers[0]['name'] is None:
+                    # Port scan found printer but SNMP failed (e.g. L3251); still use the IP
+                    self.ip_var.set(printers[0]["ip"])
+                    self.status_text.insert(tk.END, '[INFO]', "info")
+                    self.status_text.insert(
+                        tk.END,
+                        f" Found printer at {printers[0]['ip']} "
+                        f"(hostname: {printers[0]['hostname']}).\n",
+                    )
+                    self.status_text.insert(tk.END, '[WARNING]', "warn")
+                    self.status_text.insert(
+                        tk.END,
+                        " Model could not be detected via SNMP. "
+                        "Please select the model (e.g. L3251) from the list above.\n",
+                    )
                 else:
                     self.status_text.insert(tk.END, '[INFO]', "info")
                     self.status_text.insert(
                         tk.END, f" Found {len(printers)} printers:\n"
                     )
                     for printer in printers:
-                        if printers[0]['name']:
+                        if printer['name']:
                             self.status_text.insert(tk.END, '[INFO]', "info")
                             self.status_text.insert(
                                 tk.END,
@@ -3782,8 +3946,8 @@ Web site: https://github.com/Ircama/epson_print_conf
                             self.status_text.insert(tk.END, '[WARNING]', "warn")
                             self.status_text.insert(
                                 tk.END,
-                                f" Cannot contact printer {printer['ip']}"
-                                f" (hostname: {printer['hostname']}).\n",
+                                f" Printer at {printer['ip']}: model not detected via SNMP. "
+                                "Select IP and model manually if needed.\n",
                             )
             else:
                 self.status_text.insert(tk.END, '[WARNING]', "warn")

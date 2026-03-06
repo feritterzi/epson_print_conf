@@ -224,6 +224,28 @@ The GUI displays a `[NOTE]` in the status box before performing any change, spec
 
 It is recommended to copy the status history and keep it in a safe place after making changes, so that a reverse operation can be performed when needed.
 
+### Connection troubleshooting (Ethernet / Wi‑Fi)
+
+The program uses **SNMP over UDP (port 161)**. It does not distinguish Ethernet vs Wi‑Fi: if the PC and the printer are on the **same LAN** (same router), connection should work regardless of whether the PC is on Ethernet and the printer on Wi‑Fi, or vice versa.
+
+If the printer is reachable from the phone (e.g. Epson app) but not from this program on the PC, check:
+
+1. **Same network**  
+   PC and printer must be on the same subnet (e.g. both get IPs like `192.168.1.x` from the same router). Guest Wi‑Fi or “client isolation” often blocks device-to-device traffic—use the main Wi‑Fi for the printer and ensure the PC is on the same network.
+
+2. **Correct IP**  
+   Use the printer’s current IP (from the printer’s network menu or the Epson app). If the printer gets a new IP after reboot, update it in the program.
+
+3. **Ping test**  
+   From the PC, run: `ping <printer IP>`. If ping fails, fix the network before using the program.
+
+4. **Firewall**  
+   On Windows, allow Python (or the program executable) through the firewall for **outbound UDP**, or temporarily disable the firewall to test. Port **161** is used to reach the printer.
+
+5. **Timeout**  
+   The GUI uses a 5 s timeout and 2 retries. If the printer is slow to respond, use the command-line tool with a longer timeout, e.g.:  
+   `python epson_print_conf.py -m L3251 -a <IP> --timeout 10`
+
 ### Known incompatible models
 
 Some recent firmwares supported by new printers disabled SNMP EEPROM management or changed the access mode (possibly for security reasons).

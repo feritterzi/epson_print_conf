@@ -25,13 +25,17 @@ class PrinterScanner:
         except socket.error:
             return False
 
-    def get_printer_name(self, ip):
-        printer = EpsonPrinter(hostname=ip)
-        try:
-            printer_info = printer.get_snmp_info("Model")
-            return printer_info["Model"]
-        except:
-            return None
+    def get_printer_name(self, ip, timeout=5.0, retries=2):
+        printer = EpsonPrinter(hostname=ip, timeout=timeout, retries=retries)
+        # Try several OIDs; some Epson models (e.g. L3251) only answer one of them
+        for mib_name in ("Model", "Epson Printer Name", "Model short", "Descr", "Name"):
+            try:
+                printer_info = printer.get_snmp_info(mib_name)
+                if printer_info and printer_info.get(mib_name):
+                    return printer_info[mib_name].strip() or None
+            except Exception:
+                continue
+        return None
 
     def scan_ip(self, ip):
         for port in PRINTER_PORTS:
