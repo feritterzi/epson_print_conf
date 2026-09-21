@@ -168,3 +168,10 @@ devices*.xml
 .console_history
 
 lpr_jobs/
+
+# Local / OS
+.DS_Store
+Thumbs.db
+*.bak
+.vscode/
+.cursor/

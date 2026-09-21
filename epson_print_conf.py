@@ -21,6 +21,7 @@ import pickle
 import abc
 import hashlib
 import struct
+import asyncio
 
 from pysnmp.hlapi.v1arch.asyncio import *
 from pyasn1.type.univ import OctetString as OctetStringType
@@ -1294,6 +1295,12 @@ class EpsonPrinter:
         net_val = (self.hostname, self.port, self.timeout, self.retries)
         if net_val != self.used_net_val:
             try:
+                # Python 3.10+ (esp. 3.12/3.14): MainThread has no default
+                # event loop; SnmpDispatcher() requires one.
+                try:
+                    asyncio.get_event_loop()
+                except RuntimeError:
+                    asyncio.set_event_loop(asyncio.new_event_loop())
                 self.snmp_conf = (
                     SnmpDispatcher(),
                     CommunityData("public", mpModel=0),

@@ -3731,6 +3731,17 @@ Web site: https://github.com/Ircama/epson_print_conf
             self.config(cursor="")
             self.update_idletasks()
             return
+        # L3250/L3251/L3260: firmware does not allow EEPROM read/write for permanent reset
+        if self.printer.model in ("L3250", "L3251", "L3260"):
+            self.status_text.insert(tk.END, '[INFO]', "info")
+            self.status_text.insert(
+                tk.END,
+                f" Permanent reset (EEPROM) is not supported on {self.printer.model}.\n"
+                " Use \"Temporary Reset Waste Ink Levels\" instead; it works after each power-on until you replace the pad.\n"
+            )
+            self.config(cursor="")
+            self.update_idletasks()
+            return
         try:
             if "raw_waste_reset" in self.printer.parm:
                 if not self.get_current_eeprom_values(
